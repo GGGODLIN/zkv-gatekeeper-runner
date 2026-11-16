@@ -1,0 +1,23 @@
+[Unit]
+Description=Standalone Event 01 Proof Gatekeeper Runner
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=ubuntu
+WorkingDirectory=/opt/zkv-gatekeeper-runner
+Environment=NODE_ENV=production
+Environment=HOST=127.0.0.1
+Environment=PORT=3411
+Environment=SQLITE_DB_PATH=/var/lib/zkv-gatekeeper/gatekeeper.db
+EnvironmentFile=/etc/zkv-gatekeeper/gatekeeper.env
+ExecStart=/usr/bin/node --experimental-strip-types src/server.ts
+Restart=on-failure
+RestartSec=3s
+NoNewPrivileges=true
+ProtectSystem=strict
+ReadWritePaths=/var/lib/zkv-gatekeeper
+
+[Install]
+WantedBy=multi-user.target
