@@ -5,8 +5,7 @@ import type { GatekeeperTaskEnvelopeSchema } from "./types.ts";
 
 const BN254_R =
   21888242871839275222246405745257275088548364400416034343698204186575808495617n;
-const MAX_BLOCK_NUMBER = (1n << 32n) - 1n;
-const MAX_UINT64 = (1n << 64n) - 1n;
+const MAX_UINT32 = (1n << 32n) - 1n;
 
 function toFieldElement(raw: string): string {
   const trimmed = raw.trim();
@@ -87,12 +86,14 @@ export function evaluateGatekeeperRules(
     }
   }
 
-  // Enforce gatekeeper.wasm comparator domain bounds before witness generation
+  // Official gatekeeper.wasm uses 32-bit LessThan comparators across all three checks;
+  // reject out-of-domain bounds up front so BN254_R modular reduction can never forge APPROVE,
+  // while keeping trap reason codes intact (with circuitProvable=false) when minimum/amount > 2^32 - 1.
   if (
-    expiryBlock > MAX_BLOCK_NUMBER ||
-    currentBlock > MAX_BLOCK_NUMBER ||
-    minimum > MAX_UINT64 ||
-    publicBalance > MAX_UINT64
+    expiryBlock > MAX_UINT32 ||
+    currentBlock > MAX_UINT32 ||
+    publicBalance > MAX_UINT32 ||
+    maxTransfer > MAX_UINT32
   ) {
     return {
       decision: "REJECT",
@@ -101,6 +102,8 @@ export function evaluateGatekeeperRules(
       normalized,
     };
   }
+
+  const withinCircuitDomain = minimum <= MAX_UINT32 && amount <= MAX_UINT32;
 
   const vkFieldCollision =
     registeredVk !== proofVk &&
@@ -122,7 +125,7 @@ export function evaluateGatekeeperRules(
     return {
       decision: "REJECT",
       reasonKey: "VK_SUBSTITUTION",
-      circuitProvable: true,
+      circuitProvable: withinCircuitDomain,
       normalized,
     };
   }
@@ -131,7 +134,7 @@ export function evaluateGatekeeperRules(
     return {
       decision: "REJECT",
       reasonKey: "THRESHOLD_MISMATCH",
-      circuitProvable: true,
+      circuitProvable: withinCircuitDomain,
       normalized,
     };
   }
@@ -141,7 +144,7 @@ export function evaluateGatekeeperRules(
     return {
       decision: "REJECT",
       reasonKey: "EXPIRED_CONDITION",
-      circuitProvable: true,
+      circuitProvable: withinCircuitDomain,
       normalized,
     };
   }
@@ -150,7 +153,7 @@ export function evaluateGatekeeperRules(
     return {
       decision: "REJECT",
       reasonKey: "RECIPIENT_MISMATCH",
-      circuitProvable: true,
+      circuitProvable: withinCircuitDomain,
       normalized,
     };
   }
@@ -159,7 +162,7 @@ export function evaluateGatekeeperRules(
     return {
       decision: "REJECT",
       reasonKey: "AMOUNT_OVERFLOW",
-      circuitProvable: true,
+      circuitProvable: withinCircuitDomain,
       normalized,
     };
   }
@@ -211,8 +214,14 @@ export async function proveGatekeeperDecision(params: {
   });
 
   try {
+    const provePromise = snarkjs.groth16.fullProve(
+      circuitInput,
+      params.wasmPath,
+      params.zkeyPath,
+    );
+    provePromise.catch(() => undefined);
     const result = (await Promise.race([
-      snarkjs.groth16.fullProve(circuitInput, params.wasmPath, params.zkeyPath),
+      provePromise,
       timeoutPromise,
     ])) as { proof: Record<string, unknown>; publicSignals: string[] };
     const valid = await snarkjs.groth16.verify(

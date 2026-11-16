@@ -572,4 +572,99 @@ describe("zkv-gatekeeper-runner /gatekeeper/agent acceptance", () => {
       await canonicalHandle.close();
     }
   });
+
+  it("enforces 32-bit comparator bounds against BN254_R wraparound, caps body size at 64 KiB, and does not cache soft-deadline 504", async () => {
+    const bn254R =
+      21888242871839275222246405745257275088548364400416034343698204186575808495617n;
+    const wrapPayload = JSON.stringify(
+      makeTaskPayload({
+        task_id: "gk_wrap_bn254",
+        input: {
+          amount: (bn254R + 500n).toString(10),
+          max_transfer: (bn254R + 1000n).toString(10),
+          proof_tx: "0xwrap1",
+        },
+      }),
+    );
+    const wrapRes = await postSigned(
+      baseUrl,
+      "/gatekeeper/agent",
+      wrapPayload,
+      signRaw(wrapPayload, PRIMARY_SECRET),
+    );
+    assert.equal(wrapRes.status, 200);
+    assert.equal(wrapRes.json.decision, "REJECT");
+
+    const trapOverflow = JSON.stringify(
+      makeTaskPayload({
+        task_id: "gk_trap_gt32",
+        input: {
+          amount: "5000000000",
+          max_transfer: "1000",
+          proof_tx: "0xwrap2",
+        },
+      }),
+    );
+    const trapRes = await postSigned(
+      baseUrl,
+      "/gatekeeper/agent",
+      trapOverflow,
+      signRaw(trapOverflow, PRIMARY_SECRET),
+    );
+    assert.equal(trapRes.status, 200);
+    assert.equal(trapRes.json.decision, "REJECT");
+    assert.equal(trapRes.json.reason_code, "AMOUNT_OVERFLOW");
+
+    const hugeBody = JSON.stringify({ pad: "x".repeat(80 * 1024) });
+    const hugeRes = await postSigned(
+      baseUrl,
+      "/gatekeeper/agent",
+      hugeBody,
+      signRaw(hugeBody, PRIMARY_SECRET),
+    );
+    assert.equal(hugeRes.status, 413);
+
+    const tightDbPath = path.join(tmpDir, "tight-deadline.db");
+    const tightHandle = await createGatekeeperServer({
+      port: 0,
+      host: "127.0.0.1",
+      hmacSecret: PRIMARY_SECRET,
+      dbPath: tightDbPath,
+      wasmPath: WASM_PATH,
+      zkeyPath: ZKEY_PATH,
+      vkPath: VK_PATH,
+      softDeadlineMs: 1,
+    });
+    const retryBody = JSON.stringify(
+      makeTaskPayload({
+        task_id: "gk_timeout_retry",
+        input: { proof_tx: "0xtimeoutretry" },
+      }),
+    );
+    const retrySig = signRaw(retryBody, PRIMARY_SECRET);
+    try {
+      const timedOut = await postSigned(tightHandle.url, "/gatekeeper/agent", retryBody, retrySig);
+      assert.equal(timedOut.status, 504);
+    } finally {
+      await tightHandle.close();
+    }
+
+    const normalHandle = await createGatekeeperServer({
+      port: 0,
+      host: "127.0.0.1",
+      hmacSecret: PRIMARY_SECRET,
+      dbPath: tightDbPath,
+      wasmPath: WASM_PATH,
+      zkeyPath: ZKEY_PATH,
+      vkPath: VK_PATH,
+      softDeadlineMs: 45_000,
+    });
+    try {
+      const recovered = await postSigned(normalHandle.url, "/gatekeeper/agent", retryBody, retrySig);
+      assert.equal(recovered.status, 200);
+      assert.equal(recovered.json.decision, "APPROVE");
+    } finally {
+      await normalHandle.close();
+    }
+  });
 });

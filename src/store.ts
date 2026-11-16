@@ -111,6 +111,7 @@ export class GatekeeperStore {
     responseJson: string;
   }):
     | { status: "CACHED"; responseJson: string }
+    | { status: "TASK_ID_CONFLICT" }
     | { status: "PROOF_REUSED" }
     | { status: "COMMITTED"; responseJson: string } {
     const now = new Date().toISOString();
@@ -123,8 +124,11 @@ export class GatekeeperStore {
         | { raw_body_sha256: string; response_json: string }
         | undefined;
 
-      if (existing && existing.raw_body_sha256 === params.rawBodySha256) {
-        return { status: "CACHED", responseJson: existing.response_json };
+      if (existing) {
+        if (existing.raw_body_sha256 === params.rawBodySha256) {
+          return { status: "CACHED", responseJson: existing.response_json };
+        }
+        return { status: "TASK_ID_CONFLICT" };
       }
 
       if (params.decision === "APPROVE") {

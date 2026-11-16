@@ -17,11 +17,30 @@ import {
 } from "./types.ts";
 
 const DEFAULT_SOFT_DEADLINE_MS = 45_000;
+const MAX_BODY_BYTES = 64 * 1024;
+const SIGNATURE_HEX_RE = /^(?:sha256=)?[0-9a-f]{64}$/i;
 
-async function readRawBody(req: http.IncomingMessage): Promise<Buffer> {
+class PayloadTooLargeError extends Error {
+  public constructor(maxBytes: number) {
+    super(`Request body exceeds ${maxBytes} bytes`);
+    this.name = "PayloadTooLargeError";
+  }
+}
+
+async function readRawBody(
+  req: http.IncomingMessage,
+  maxBytes: number = MAX_BODY_BYTES,
+): Promise<Buffer> {
   const chunks: Buffer[] = [];
+  let total = 0;
   for await (const chunk of req) {
-    chunks.push(Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk));
+    const buf = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk);
+    total += buf.length;
+    if (total > maxBytes) {
+      req.resume();
+      throw new PayloadTooLargeError(maxBytes);
+    }
+    chunks.push(buf);
   }
   return Buffer.concat(chunks);
 }
@@ -31,11 +50,13 @@ function sendSignedJson(
   statusCode: number,
   rawJson: string,
   hmacSecret: string,
+  closeConnection: boolean = false,
 ): void {
   const signature = signOutboundHmac(rawJson, hmacSecret);
   res.writeHead(statusCode, {
     "content-type": "application/json; charset=utf-8",
     "x-agent-games-signature": signature,
+    ...(closeConnection ? { connection: "close" } : {}),
   });
   res.end(rawJson);
 }
@@ -78,7 +99,36 @@ export async function createGatekeeperServer(options: {
     res: http.ServerResponse,
   ): Promise<void> => {
     const requestStartedMs = Date.now();
-    const rawBody = await readRawBody(req);
+    const rawHeader = req.headers["x-agent-games-signature"];
+    const sigText = (Array.isArray(rawHeader) ? rawHeader[0] : rawHeader)?.trim() ?? "";
+    if (!SIGNATURE_HEX_RE.test(sigText)) {
+      req.resume();
+      sendSignedJson(
+        res,
+        401,
+        JSON.stringify({ error: "Invalid HMAC signature" }),
+        options.hmacSecret,
+        true,
+      );
+      return;
+    }
+
+    let rawBody: Buffer;
+    try {
+      rawBody = await readRawBody(req, MAX_BODY_BYTES);
+    } catch (err: unknown) {
+      if (err instanceof PayloadTooLargeError) {
+        sendSignedJson(
+          res,
+          413,
+          JSON.stringify({ error: err.message }),
+          options.hmacSecret,
+          true,
+        );
+        return;
+      }
+      throw err;
+    }
 
     // Verify raw-body HMAC BEFORE parsing JSON
     const sigOk = verifyInboundHmac(
@@ -189,9 +239,18 @@ export async function createGatekeeperServer(options: {
     } | null = null;
 
     const elapsedMs = Date.now() - requestStartedMs;
-    const remainingForProve = Math.max(1_000, softDeadlineMs - elapsedMs);
+    const remainingForProve = softDeadlineMs - elapsedMs;
 
     if (evaluation.circuitProvable) {
+      if (remainingForProve <= 0) {
+        sendSignedJson(
+          res,
+          504,
+          JSON.stringify({ error: "Soft deadline exceeded" }),
+          options.hmacSecret,
+        );
+        return;
+      }
       try {
         const proveRes = await proveGatekeeperDecision({
           taskId: task.task_id,
@@ -220,6 +279,15 @@ export async function createGatekeeperServer(options: {
             detail: msg,
           }),
         );
+        if (msg.includes("soft deadline exceeded")) {
+          sendSignedJson(
+            res,
+            504,
+            JSON.stringify({ error: "Soft deadline exceeded" }),
+            options.hmacSecret,
+          );
+          return;
+        }
         decision = "REJECT";
         reasonCode = resolveReasonCode("INVALID_PAYLOAD", profile);
       }
@@ -243,6 +311,20 @@ export async function createGatekeeperServer(options: {
       decision,
       responseJson: JSON.stringify(outBody),
     });
+
+    if (committed.status === "TASK_ID_CONFLICT") {
+      sendSignedJson(
+        res,
+        200,
+        JSON.stringify({
+          decision: "REJECT",
+          reason_code: resolveReasonCode("INVALID_PAYLOAD", profile),
+          proof_tx: task.input.proof_tx,
+        }),
+        options.hmacSecret,
+      );
+      return;
+    }
 
     if (committed.status === "PROOF_REUSED") {
       const json = JSON.stringify({
