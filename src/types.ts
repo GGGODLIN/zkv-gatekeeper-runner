@@ -1,19 +1,6 @@
 import { z } from "zod";
-import type { Groth16Proof } from "snarkjs";
 
-export type ReasonCodeProfile = "event_page" | "canonical_rules";
-
-export type ReasonKey =
-  | "VALID_CONDITION"
-  | "VK_SUBSTITUTION"
-  | "THRESHOLD_MISMATCH"
-  | "PROOF_REUSED"
-  | "EXPIRED_CONDITION"
-  | "RECIPIENT_MISMATCH"
-  | "AMOUNT_OVERFLOW"
-  | "INVALID_PAYLOAD";
-
-const EVENT_PAGE_CODES: Record<ReasonKey, string> = {
+const EVENT_PAGE_CODES: Record<string, string> = {
   VALID_CONDITION: "VALID_CONDITION",
   VK_SUBSTITUTION: "VK_SUBSTITUTION",
   THRESHOLD_MISMATCH: "THRESHOLD_MISMATCH",
@@ -24,7 +11,7 @@ const EVENT_PAGE_CODES: Record<ReasonKey, string> = {
   INVALID_PAYLOAD: "PROOF_INVALID",
 };
 
-const CANONICAL_RULES_CODES: Record<ReasonKey, string> = {
+const CANONICAL_RULES_CODES: Record<string, string> = {
   VALID_CONDITION: "VALID_PROOF",
   VK_SUBSTITUTION: "VK_SUBSTITUTION",
   THRESHOLD_MISMATCH: "THRESHOLD_MISMATCH",
@@ -36,12 +23,12 @@ const CANONICAL_RULES_CODES: Record<ReasonKey, string> = {
 };
 
 export function resolveReasonCode(
-  key: ReasonKey,
-  profile: ReasonCodeProfile,
+  key: string,
+  profile: "event_page" | "canonical_rules",
 ): string {
-  return profile === "canonical_rules"
-    ? CANONICAL_RULES_CODES[key]
-    : EVENT_PAGE_CODES[key];
+  const table =
+    profile === "canonical_rules" ? CANONICAL_RULES_CODES : EVENT_PAGE_CODES;
+  return table[key] ?? "PROOF_INVALID";
 }
 
 const NonNegativeIntInputSchema = z.union([
@@ -83,42 +70,3 @@ export const GatekeeperTaskEnvelopeSchema = z.object({
   deadline_at: z.string().optional(),
   input: GatekeeperInputSchema,
 });
-
-export type GatekeeperTaskEnvelope = z.infer<
-  typeof GatekeeperTaskEnvelopeSchema
->;
-export type GatekeeperTaskInput = z.infer<typeof GatekeeperInputSchema>;
-export type TaskMode = GatekeeperTaskEnvelope["mode"];
-
-export interface GatekeeperResponse {
-  decision: "APPROVE" | "REJECT";
-  reason_code: string;
-  proof_tx?: string;
-  proof?: Groth16Proof;
-  public_signals?: string[];
-  kurier_job_id?: string;
-}
-
-export interface GatekeeperServerOptions {
-  port?: number;
-  host?: string;
-  hmacSecret: string;
-  hmacSecretPrevious?: string;
-  hmacSecretFormat?: "utf8" | "hex" | "auto";
-  dbPath: string;
-  wasmPath: string;
-  zkeyPath: string;
-  vkPath: string;
-  reasonCodeProfile?: ReasonCodeProfile;
-  softDeadlineMs?: number;
-  kurierApiKey?: string;
-  kurierApiUrl?: string;
-  kurierTimeoutMs?: number;
-  log?: (line: string) => void;
-}
-
-export interface GatekeeperServerHandle {
-  url: string;
-  port: number;
-  close: () => Promise<void>;
-}

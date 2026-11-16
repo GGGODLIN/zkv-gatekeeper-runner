@@ -1,22 +1,32 @@
 import crypto from "node:crypto";
 import * as snarkjs from "snarkjs";
-import type { Groth16Proof } from "snarkjs";
-import type {
-  GatekeeperTaskEnvelope,
-  ReasonKey,
-} from "./types.ts";
-
-export const OFFICIAL_GATEKEEPER_VK_HASH =
-  "0x6b79c6012a6d8651f3e13bc4d2a20370280ab49700c90c5316d4168bfbad77b0";
+import type { z } from "zod";
+import type { GatekeeperTaskEnvelopeSchema } from "./types.ts";
 
 const BN254_R =
   21888242871839275222246405745257275088548364400416034343698204186575808495617n;
 const MAX_BLOCK_NUMBER = (1n << 32n) - 1n;
 const MAX_UINT64 = (1n << 64n) - 1n;
 
-export interface EvaluationOutcome {
+function toFieldElement(raw: string): string {
+  const trimmed = raw.trim();
+  if (/^0x[0-9a-fA-F]+$/i.test(trimmed) || /^\d+$/.test(trimmed)) {
+    return (BigInt(trimmed) % BN254_R).toString(10);
+  }
+  const digestHex = crypto.createHash("sha256").update(trimmed).digest("hex");
+  return (BigInt(`0x${digestHex}`) % BN254_R).toString(10);
+}
+
+function parseUnsignedBigInt(value: string | number): bigint {
+  return typeof value === "number" ? BigInt(value) : BigInt(value.trim());
+}
+
+export function evaluateGatekeeperRules(
+  task: z.infer<typeof GatekeeperTaskEnvelopeSchema>,
+  nowMs: number = Date.now(),
+): {
   decision: "APPROVE" | "REJECT";
-  reasonKey: ReasonKey;
+  reasonKey: string;
   circuitProvable: boolean;
   normalized: {
     registeredVk: string;
@@ -30,41 +40,12 @@ export interface EvaluationOutcome {
     amount: bigint;
     maxTransfer: bigint;
   };
-}
-
-function normalizeIdentifier(raw: string): string {
-  const trimmed = raw.trim();
-  if (/^0x[0-9a-fA-F]+$/i.test(trimmed)) {
-    return `0x${BigInt(trimmed).toString(16)}`;
-  }
-  return trimmed;
-}
-
-function toFieldElement(raw: string): string {
-  const trimmed = raw.trim();
-  if (/^0x[0-9a-fA-F]+$/i.test(trimmed) || /^\d+$/.test(trimmed)) {
-    return (BigInt(trimmed) % BN254_R).toString(10);
-  }
-  const digestHex = crypto.createHash("sha256").update(trimmed).digest("hex");
-  return (BigInt(`0x${digestHex}`) % BN254_R).toString(10);
-}
-
-function parseUnsignedBigInt(value: string | number): bigint {
-  if (typeof value === "number") {
-    return BigInt(value);
-  }
-  return BigInt(value.trim());
-}
-
-export function evaluateGatekeeperRules(
-  task: GatekeeperTaskEnvelope,
-  nowMs: number = Date.now(),
-): EvaluationOutcome {
+} {
   const input = task.input;
-  const registeredVk = normalizeIdentifier(input.registered_vk);
-  const proofVk = normalizeIdentifier(input.proof_vk);
-  const recipient = normalizeIdentifier(input.recipient);
-  const conditionRecipient = normalizeIdentifier(input.condition_recipient);
+  const registeredVk = input.registered_vk.trim().toLowerCase();
+  const proofVk = input.proof_vk.trim().toLowerCase();
+  const recipient = input.recipient.trim().toLowerCase();
+  const conditionRecipient = input.condition_recipient.trim().toLowerCase();
 
   const minimum = parseUnsignedBigInt(input.minimum);
   const publicBalance = parseUnsignedBigInt(input.public_balance);
@@ -121,7 +102,6 @@ export function evaluateGatekeeperRules(
     };
   }
 
-  // Guard against mod-r collision between unequal raw identifiers
   const vkFieldCollision =
     registeredVk !== proofVk &&
     toFieldElement(registeredVk) === toFieldElement(proofVk);
@@ -194,12 +174,12 @@ export function evaluateGatekeeperRules(
 
 export async function proveGatekeeperDecision(params: {
   taskId: string;
-  evaluation: EvaluationOutcome;
+  evaluation: ReturnType<typeof evaluateGatekeeperRules>;
   wasmPath: string;
   zkeyPath: string;
   vk: Record<string, unknown>;
   timeoutMs: number;
-}): Promise<{ proof: Groth16Proof; publicSignals: string[] } | null> {
+}): Promise<{ proof: Record<string, unknown>; publicSignals: string[] } | null> {
   const { evaluation } = params;
   if (!evaluation.circuitProvable) return null;
 
@@ -231,10 +211,10 @@ export async function proveGatekeeperDecision(params: {
   });
 
   try {
-    const result = await Promise.race([
+    const result = (await Promise.race([
       snarkjs.groth16.fullProve(circuitInput, params.wasmPath, params.zkeyPath),
       timeoutPromise,
-    ]);
+    ])) as { proof: Record<string, unknown>; publicSignals: string[] };
     const valid = await snarkjs.groth16.verify(
       params.vk,
       result.publicSignals,

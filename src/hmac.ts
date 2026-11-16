@@ -1,25 +1,6 @@
 import crypto from "node:crypto";
 
-export type HmacSecretFormat = "utf8" | "hex" | "auto";
-
 const HEX_64_RE = /^[0-9a-f]{64}$/i;
-
-function resolveCandidateKeys(
-  secret: string,
-  format: HmacSecretFormat,
-): (string | Buffer)[] {
-  if (format === "hex") {
-    return HEX_64_RE.test(secret) ? [Buffer.from(secret, "hex")] : [secret];
-  }
-  if (format === "utf8") {
-    return [secret];
-  }
-  const keys: (string | Buffer)[] = [secret];
-  if (HEX_64_RE.test(secret)) {
-    keys.push(Buffer.from(secret, "hex"));
-  }
-  return keys;
-}
 
 function normalizeSignatureHeader(
   headerValue: string | string[] | undefined,
@@ -34,38 +15,25 @@ function normalizeSignatureHeader(
 export function verifyInboundHmac(
   rawBody: Buffer,
   headerValue: string | string[] | undefined,
-  secrets: readonly string[],
-  format: HmacSecretFormat = "auto",
+  secret: string,
 ): boolean {
+  if (!secret) return false;
   const provided = normalizeSignatureHeader(headerValue);
   if (!provided) return false;
 
-  for (const secret of secrets) {
-    if (!secret) continue;
-    for (const key of resolveCandidateKeys(secret, format)) {
-      const expected = crypto
-        .createHmac("sha256", key)
-        .update(rawBody)
-        .digest();
-      if (
-        expected.length === provided.length &&
-        crypto.timingSafeEqual(expected, provided)
-      ) {
-        return true;
-      }
-    }
-  }
-  return false;
+  const expected = crypto
+    .createHmac("sha256", secret)
+    .update(rawBody)
+    .digest();
+  return (
+    expected.length === provided.length &&
+    crypto.timingSafeEqual(expected, provided)
+  );
 }
 
 export function signOutboundHmac(
   rawBody: Buffer | string,
   secret: string,
-  format: "utf8" | "hex" = "utf8",
 ): string {
-  const key =
-    format === "hex" && HEX_64_RE.test(secret)
-      ? Buffer.from(secret, "hex")
-      : secret;
-  return crypto.createHmac("sha256", key).update(rawBody).digest("hex");
+  return crypto.createHmac("sha256", secret).update(rawBody).digest("hex");
 }

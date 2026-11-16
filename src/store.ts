@@ -1,18 +1,6 @@
 import fs from "node:fs";
 import path from "node:path";
 import { DatabaseSync } from "node:sqlite";
-import type { TaskMode } from "./types.ts";
-
-export type PrecheckResult =
-  | { status: "CACHED"; responseJson: string }
-  | { status: "TASK_ID_CONFLICT" }
-  | { status: "PROOF_REUSED" }
-  | { status: "MISS" };
-
-export type CommitResult =
-  | { status: "CACHED"; responseJson: string }
-  | { status: "PROOF_REUSED" }
-  | { status: "COMMITTED"; responseJson: string };
 
 export class GatekeeperStore {
   private readonly db: DatabaseSync;
@@ -61,9 +49,13 @@ export class GatekeeperStore {
   public precheckTask(
     taskId: string,
     rawBodySha256: string,
-    mode: TaskMode,
+    mode: "practice" | "competition",
     proofTx: string,
-  ): PrecheckResult {
+  ):
+    | { status: "CACHED"; responseJson: string }
+    | { status: "TASK_ID_CONFLICT" }
+    | { status: "PROOF_REUSED" }
+    | { status: "MISS" } {
     return this.runImmediate(() => {
       // Idempotency cache MUST be checked before seen_proofs so network retries never self-trigger PROOF_REUSED.
       const cached = this.db
@@ -113,11 +105,14 @@ export class GatekeeperStore {
   public commitTaskOutcome(params: {
     taskId: string;
     rawBodySha256: string;
-    mode: TaskMode;
+    mode: "practice" | "competition";
     proofTx: string;
     decision: "APPROVE" | "REJECT";
     responseJson: string;
-  }): CommitResult {
+  }):
+    | { status: "CACHED"; responseJson: string }
+    | { status: "PROOF_REUSED" }
+    | { status: "COMMITTED"; responseJson: string } {
     const now = new Date().toISOString();
     return this.runImmediate(() => {
       const existing = this.db

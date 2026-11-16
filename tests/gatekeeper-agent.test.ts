@@ -2,7 +2,6 @@ import { after, before, describe, it } from "node:test";
 import assert from "node:assert/strict";
 import crypto from "node:crypto";
 import fs from "node:fs";
-import http from "node:http";
 import os from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
@@ -17,9 +16,6 @@ const ZKEY_PATH = path.join(REPO_ROOT, "circuits", "gatekeeper_final.zkey");
 const VK_PATH = path.join(REPO_ROOT, "circuits", "verification_key.json");
 
 const PRIMARY_SECRET = "test-hmac-secret-synthetic-0001";
-const PREVIOUS_SECRET = "test-hmac-secret-synthetic-prev";
-const OFFICIAL_VK_HASH =
-  "0x6b79c6012a6d8651f3e13bc4d2a20370280ab49700c90c5316d4168bfbad77b0";
 
 function signRaw(rawBody: string | Buffer, secret: string): string {
   return crypto.createHmac("sha256", secret).update(rawBody).digest("hex");
@@ -115,7 +111,6 @@ describe("zkv-gatekeeper-runner /gatekeeper/agent acceptance", () => {
       port: 0,
       host: "127.0.0.1",
       hmacSecret: PRIMARY_SECRET,
-      hmacSecretPrevious: PREVIOUS_SECRET,
       dbPath,
       wasmPath: WASM_PATH,
       zkeyPath: ZKEY_PATH,
@@ -134,21 +129,7 @@ describe("zkv-gatekeeper-runner /gatekeeper/agent acceptance", () => {
       .curve_bn128?.terminate();
   });
 
-  it("exposes /healthz with official vk_hash and zero secret leakage", async () => {
-    const res = await fetch(`${baseUrl}/healthz`);
-    assert.equal(res.status, 200);
-    const bodyText = await res.text();
-    const json = JSON.parse(bodyText) as Record<string, unknown>;
-    assert.equal(json.ok, true);
-    assert.equal(json.vk_hash, OFFICIAL_VK_HASH);
-    assert.equal(
-      bodyText.includes(PRIMARY_SECRET),
-      false,
-      "healthz must not expose HMAC secret",
-    );
-  });
-
-  it("rejects unsigned, tampered, or bad-HMAC malformed requests with 401 before JSON parsing", async () => {
+  it("rejects unsigned, tampered, or bad-HMAC malformed requests with signed 401 before JSON parsing", async () => {
     const validRaw = JSON.stringify(makeTaskPayload());
 
     const unsigned = await postSigned(
@@ -158,6 +139,10 @@ describe("zkv-gatekeeper-runner /gatekeeper/agent acceptance", () => {
       undefined,
     );
     assert.equal(unsigned.status, 401);
+    assert.equal(
+      verifySig(unsigned.rawBody, unsigned.signature, PRIMARY_SECRET),
+      true,
+    );
 
     const tampered = await postSigned(
       baseUrl,
@@ -166,6 +151,10 @@ describe("zkv-gatekeeper-runner /gatekeeper/agent acceptance", () => {
       signRaw(validRaw + " ", PRIMARY_SECRET),
     );
     assert.equal(tampered.status, 401);
+    assert.equal(
+      verifySig(tampered.rawBody, tampered.signature, PRIMARY_SECRET),
+      true,
+    );
 
     // Invalid JSON with invalid signature must still fail with 401 (HMAC checked before JSON.parse)
     const badJsonBadHmac = await postSigned(
@@ -175,6 +164,14 @@ describe("zkv-gatekeeper-runner /gatekeeper/agent acceptance", () => {
       "deadbeef".repeat(8),
     );
     assert.equal(badJsonBadHmac.status, 401);
+    assert.equal(
+      verifySig(
+        badJsonBadHmac.rawBody,
+        badJsonBadHmac.signature,
+        PRIMARY_SECRET,
+      ),
+      true,
+    );
 
     // Invalid JSON with VALID signature fails closed to signed 200 REJECT
     const badJsonValidHmac = await postSigned(
@@ -186,7 +183,11 @@ describe("zkv-gatekeeper-runner /gatekeeper/agent acceptance", () => {
     assert.equal(badJsonValidHmac.status, 200);
     assert.equal(badJsonValidHmac.json.decision, "REJECT");
     assert.equal(
-      verifySig(badJsonValidHmac.rawBody, badJsonValidHmac.signature, PRIMARY_SECRET),
+      verifySig(
+        badJsonValidHmac.rawBody,
+        badJsonValidHmac.signature,
+        PRIMARY_SECRET,
+      ),
       true,
     );
   });
@@ -205,7 +206,7 @@ describe("zkv-gatekeeper-runner /gatekeeper/agent acceptance", () => {
         baseUrl,
         route,
         preflight,
-        `sha256=${signRaw(preflight, PREVIOUS_SECRET)}`,
+        `sha256=${signRaw(preflight, PRIMARY_SECRET)}`,
       );
       const elapsedMs = performance.now() - started;
 
@@ -363,10 +364,10 @@ describe("zkv-gatekeeper-runner /gatekeeper/agent acceptance", () => {
     assert.equal(expiredRes.json.decision, "REJECT");
     assert.equal(expiredRes.json.reason_code, "EXPIRED_CONDITION");
 
-    // Numeric overflow beyond 64-bit / circuit range -> fail closed REJECT
+    // Numeric overflow beyond circuit range -> fail closed REJECT
     const overflowPayload = makeTaskPayload({
       input: {
-        expiry_block: "340282366920938463463374607431768211456", // 2^128
+        expiry_block: "340282366920938463463374607431768211456",
       },
     });
     const overflowRaw = JSON.stringify(overflowPayload);
@@ -496,7 +497,7 @@ describe("zkv-gatekeeper-runner /gatekeeper/agent acceptance", () => {
     assert.equal(c3Res.json.decision, "REJECT");
     assert.equal(c3Res.json.reason_code, "PROOF_REUSED");
 
-    // 7. Concurrent distinct task_ids racing on the same fresh proof_tx -> exactly one APPROVE and one PROOF_REUSED
+    // 7. Concurrent distinct task_ids racing on the same fresh proof_tx -> atomic SQLite BEGIN IMMEDIATE leaves exactly one APPROVE and one PROOF_REUSED
     const raceProofTx = `0x${crypto.randomBytes(16).toString("hex")}`;
     const raceA = JSON.stringify(
       makeTaskPayload({
@@ -522,25 +523,7 @@ describe("zkv-gatekeeper-runner /gatekeeper/agent acceptance", () => {
     assert.equal(rejected.json.reason_code, "PROOF_REUSED");
   });
 
-  it("supports canonical_rules REASON_CODE_PROFILE and scrubs Kurier API key on error/timeout fallback", async () => {
-    const syntheticKurierKey = "kurier-synthetic-test-key-0001";
-    const capturedLogs: string[] = [];
-
-    // Local HTTP mock representing external Kurier service returning 500
-    const kurierServer = http.createServer((req, res) => {
-      res.writeHead(500, { "content-type": "application/json" });
-      res.end(
-        JSON.stringify({
-          error: `Upstream failure at /submit-proof/${syntheticKurierKey}`,
-        }),
-      );
-    });
-    await new Promise<void>((resolve) =>
-      kurierServer.listen(0, "127.0.0.1", resolve),
-    );
-    const kurierAddr = kurierServer.address() as { port: number };
-    const kurierBaseUrl = `http://127.0.0.1:${kurierAddr.port}/api/v1`;
-
+  it("supports configurable canonical_rules REASON_CODE_PROFILE", async () => {
     const canonicalDbPath = path.join(tmpDir, "canonical.db");
     const canonicalHandle = await createGatekeeperServer({
       port: 0,
@@ -551,11 +534,7 @@ describe("zkv-gatekeeper-runner /gatekeeper/agent acceptance", () => {
       zkeyPath: ZKEY_PATH,
       vkPath: VK_PATH,
       reasonCodeProfile: "canonical_rules",
-      kurierApiKey: syntheticKurierKey,
-      kurierApiUrl: kurierBaseUrl,
-      kurierTimeoutMs: 2_000,
       softDeadlineMs: 45_000,
-      log: (line: string) => capturedLogs.push(line),
     });
 
     try {
@@ -576,7 +555,6 @@ describe("zkv-gatekeeper-runner /gatekeeper/agent acceptance", () => {
       assert.equal(r1.json.reason_code, "VALID_PROOF");
       assert.ok(r1.json.proof && Array.isArray(r1.json.public_signals));
 
-      // Replay maps to PROOF_REPLAY under canonical_rules
       const p2 = makeTaskPayload({
         task_id: "gk_canon_2",
         mode: "competition",
@@ -590,22 +568,8 @@ describe("zkv-gatekeeper-runner /gatekeeper/agent acceptance", () => {
       );
       assert.equal(r2.json.decision, "REJECT");
       assert.equal(r2.json.reason_code, "PROOF_REPLAY");
-
-      // Secret redaction check + positive control
-      const combinedLogs = capturedLogs.join("\n");
-      assert.equal(
-        combinedLogs.includes(syntheticKurierKey),
-        false,
-        "Kurier API key must never appear in logs",
-      );
-      assert.equal(
-        combinedLogs.includes("[REDACTED_KURIER_KEY]"),
-        true,
-        "Positive control: scrubbed Kurier path marker must appear in failure log",
-      );
     } finally {
       await canonicalHandle.close();
-      await new Promise<void>((resolve) => kurierServer.close(() => resolve()));
     }
   });
 });
