@@ -1,0 +1,12 @@
+node_modules/
+dist/
+.scratch/
+.worktrees/
+.env
+.env.*
+!.env.example
+*.db
+*.db-wal
+*.db-shm
+.DS_Store
+tsconfig.tsbuildinfo
